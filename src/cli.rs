@@ -1,24 +1,36 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-/// A minimalistic Wayland input method
+#[command(name = "wayime", version, about = "Wayland input method")]
 pub struct Args {
-    /// TSV dictionary path
-    #[arg(long, value_name = "WAYIME_DICT_PATH")]
+    /// Path to the TSV dictionary.
+    #[arg(long, value_name = "PATH")]
     pub dict: Option<PathBuf>,
-    /// Number of candidates to display per page
-    #[arg(long, default_value = "5", value_parser = parse_page_size)]
+
+    /// Number of candidates displayed on each page.
+    #[arg(long, default_value = "5", value_name = "N")]
     pub page_size: NonZeroUsize,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
 }
 
-fn parse_page_size(value: &str) -> std::result::Result<NonZeroUsize, String> {
-    let page_size = value
-        .parse::<usize>()
-        .map_err(|_| "page size must be an integer between 1 and 10".to_owned())?;
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Manage the speech-recognition model.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
 
-    NonZeroUsize::new(page_size)
-        .filter(|page_size| page_size.get() <= 10)
-        .ok_or_else(|| "page size must be between 1 and 10".to_owned())
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// Show the download status of the Whisper model.
+    Show,
+
+    /// Download the Whisper model.
+    Download,
 }

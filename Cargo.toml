@@ -9,6 +9,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 dirs = "7"
+hf-hub = { version = "1.0", features = ["blocking"] }
 libc = "0.2.191"
 # rquickjs = "0.14.0"
 rquickjs = { package = "quickjs-jit", version = "=0.14.1" }
@@ -27,4 +28,3 @@ tracing-subscriber = {
 }
 wayland-client = "0.31.15"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
-

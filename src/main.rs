@@ -17,7 +17,7 @@ use wayland_protocols_misc::{
 
 use crate::{
     app::App,
-    cli::Args,
+    cli::{Args, Command, ModelCommand},
     config::Config,
     utils::{default_cache_path, default_dict_path},
 };
@@ -28,6 +28,7 @@ mod config;
 mod engine;
 mod error;
 mod keys;
+mod model;
 mod utils;
 
 fn main() {
@@ -42,6 +43,7 @@ fn main() {
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -52,13 +54,31 @@ fn init_logging() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+
+    match args.command.as_ref() {
+        Some(Command::Model {
+            command: ModelCommand::Show,
+        }) => {
+            return model::show();
+        }
+        Some(Command::Model {
+            command: ModelCommand::Download,
+        }) => {
+            return model::download();
+        }
+        None => {}
+    }
+
     let config = Config::load_default().context("failed to load JavaScript config")?;
+
     let dict_path = match args.dict {
         Some(path) => path,
         None => default_dict_path()?,
     };
+
     let cache_path = default_cache_path()?;
     let page_size = args.page_size;
+
     let load_started = Instant::now();
     let engine = Engine::load(&dict_path, &cache_path).with_context(|| {
         format!(
@@ -67,6 +87,7 @@ fn run() -> Result<()> {
             cache_path.display()
         )
     })?;
+
     info!(
         dict = %dict_path.display(),
         cache = %cache_path.display(),
@@ -81,12 +102,16 @@ fn run() -> Result<()> {
     let seat: WlSeat = globals
         .bind(&qh, 1..=9, ())
         .context("no wl_seat global; this example expects one seat")?;
+
     let input_method_manager: ZwpInputMethodManagerV2 = globals
         .bind(&qh, 1..=1, ())
         .context("compositor does not expose zwp_input_method_manager_v2")?;
+
     let virtual_keyboard_manager: ZwpVirtualKeyboardManagerV1 = globals
         .bind(&qh, 1..=1, ())
-        .context("compositor does not expose zwp_virtual_keyboard_manager_v1; forwarding unhandled keys needs it")?;
+        .context(
+            "compositor does not expose zwp_virtual_keyboard_manager_v1; forwarding unhandled keys needs it",
+        )?;
 
     let input_method = input_method_manager.get_input_method(&seat, &qh, ());
 
@@ -122,6 +147,7 @@ fn run() -> Result<()> {
         repeat_support = true,
         "wayime started; Ctrl+Space toggles IME, '-'/'=' change candidate page"
     );
+
     while !app.unavailable {
         event_queue.dispatch_pending(&mut app)?;
         event_queue.flush()?;
@@ -130,17 +156,20 @@ fn run() -> Result<()> {
             // Events arrived between dispatch_pending and prepare_read.
             continue;
         };
+
         let mut descriptor = libc::pollfd {
             fd: read_guard.connection_fd().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
+
         let poll_result = unsafe { libc::poll(&mut descriptor, 1, app.repeat_timeout_ms()) };
 
         if poll_result > 0 {
             let wayland_ready = descriptor.revents
                 & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
                 != 0;
+
             if wayland_ready {
                 read_guard.read()?;
             } else {
@@ -148,11 +177,14 @@ fn run() -> Result<()> {
             }
         } else {
             drop(read_guard);
+
             if poll_result < 0 {
                 let error = std::io::Error::last_os_error();
+
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
+
                 return Err(error).context("polling Wayland connection");
             }
 
@@ -160,5 +192,6 @@ fn run() -> Result<()> {
             app.handle_repeat_tick();
         }
     }
+
     Ok(())
 }
