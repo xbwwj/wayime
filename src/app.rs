@@ -27,6 +27,7 @@ use wayland_protocols_misc::{
 };
 
 use crate::{
+    config::Config,
     engine::{Engine, Query},
     keys::*,
 };
@@ -38,6 +39,7 @@ pub struct ActiveRepeat {
 
 pub struct App {
     pub engine: Engine,
+    pub config: Config,
     pub page_size: NonZeroUsize,
     pub seat: WlSeat,
     pub input_method: ZwpInputMethodV2,
@@ -67,6 +69,8 @@ pub struct App {
     pub repeat_rate: u32,
     pub repeat_delay: Duration,
     pub active_repeat: Option<ActiveRepeat>,
+    // XXX: should not be passed this way.
+    pub expanded_candidate: Option<String>,
 }
 
 impl App {
@@ -80,10 +84,34 @@ impl App {
 
         let started = Instant::now();
         let input_len = self.composing.len();
+
+        match self.config.expand(&self.composing) {
+            Ok(Some(candidate)) => {
+                self.expanded_candidate = Some(candidate);
+
+                debug!(
+                    input_len,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "JavaScript code expansion matched"
+                );
+
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    %error,
+                    input_len,
+                    "JavaScript code expansion failed; falling back to dictionary"
+                );
+            }
+        }
+
         match self.engine.query(&self.composing, self.page_size) {
             Ok(query) => self.query = Some(query),
             Err(error) => warn!(%error, input_len, "dictionary query failed"),
         }
+
         debug!(
             input_len,
             candidate_count = self
@@ -107,10 +135,21 @@ impl App {
         // Render the actual input code first, then the current query page, then
         // arrows derived from the known exact-code count.
         let query = self.query.as_ref();
-        let candidates = query.map_or(&[][..], Query::candidates);
-        let page_index = query.map_or(0, Query::page_index);
-        let total_count = query.map_or(0, Query::total_count);
-        let has_next_page = query.is_some_and(Query::has_next_page);
+
+        let (candidates, page_index, total_count, has_next_page) =
+            if let Some(candidate) = self.expanded_candidate.as_ref() {
+                (std::slice::from_ref(candidate), 0, 1, false)
+            } else if let Some(query) = query {
+                (
+                    query.candidates(),
+                    query.page_index(),
+                    query.total_count(),
+                    query.has_next_page(),
+                )
+            } else {
+                (&[][..], 0, 0, false)
+            };
+
         let indicator = page_indicator(page_index, total_count, has_next_page);
         let indicator_reserve = if indicator.is_empty() {
             0
@@ -173,6 +212,7 @@ impl App {
     fn clear_composition(&mut self) {
         self.composing.clear();
         self.query = None;
+        self.expanded_candidate = None;
     }
 
     fn commit_text(&mut self, text: String) {
@@ -218,14 +258,25 @@ impl App {
     }
 
     fn select_candidate(&mut self, index: usize) -> bool {
-        let Some(candidate) = self
-            .query
-            .as_ref()
-            .and_then(|query| query.candidates().get(index))
-            .cloned()
-        else {
-            return false;
+        let candidate = if let Some(candidate) = self.expanded_candidate.as_ref() {
+            if index != 0 {
+                return false;
+            }
+
+            candidate.clone()
+        } else {
+            let Some(candidate) = self
+                .query
+                .as_ref()
+                .and_then(|query| query.candidates().get(index))
+                .cloned()
+            else {
+                return false;
+            };
+
+            candidate
         };
+
         self.commit_text(candidate);
         true
     }
@@ -378,10 +429,14 @@ impl App {
                 // Space commits the first candidate on the current page (or the
                 // raw code if there are no candidates), without trailing space.
                 let text = self
-                    .query
-                    .as_ref()
-                    .and_then(|query| query.candidates().first())
-                    .cloned()
+                    .expanded_candidate
+                    .clone()
+                    .or_else(|| {
+                        self.query
+                            .as_ref()
+                            .and_then(|query| query.candidates().first())
+                            .cloned()
+                    })
                     .unwrap_or_else(|| self.composing.clone());
                 self.commit_text(text);
                 return true;
@@ -414,10 +469,14 @@ impl App {
             let mut text = String::new();
             if !self.composing.is_empty() {
                 text.push_str(
-                    self.query
-                        .as_ref()
-                        .and_then(|query| query.candidates().first())
-                        .map(String::as_str)
+                    self.expanded_candidate
+                        .as_deref()
+                        .or_else(|| {
+                            self.query
+                                .as_ref()
+                                .and_then(|query| query.candidates().first())
+                                .map(String::as_str)
+                        })
                         .unwrap_or(self.composing.as_str()),
                 );
             }

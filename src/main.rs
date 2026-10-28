@@ -18,11 +18,13 @@ use wayland_protocols_misc::{
 use crate::{
     app::App,
     cli::Args,
+    config::Config,
     utils::{default_cache_path, default_dict_path},
 };
 
 mod app;
 mod cli;
+mod config;
 mod engine;
 mod error;
 mod keys;
@@ -50,6 +52,7 @@ fn init_logging() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    let config = Config::load_default().context("failed to load JavaScript config")?;
     let dict_path = match args.dict {
         Some(path) => path,
         None => default_dict_path()?,
@@ -89,6 +92,7 @@ fn run() -> Result<()> {
 
     let mut app = App {
         engine,
+        config,
         page_size,
         seat,
         input_method,
@@ -109,6 +113,7 @@ fn run() -> Result<()> {
         repeat_rate: 0,
         repeat_delay: Duration::ZERO,
         active_repeat: None,
+        expanded_candidate: None,
     };
 
     info!(
