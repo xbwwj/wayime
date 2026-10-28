@@ -1,3 +1,23 @@
-[workspace]
-resolver = "2"
-members = ["crates/wayime-engine"]
+[package]
+name = "wayime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+dirs = "7"
+libc = "0.2.191"
+rusqlite = { version = "0.41", features = ["bundled", "cache", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1.44"
+tracing-subscriber = {
+    version = "0.3",
+    features = ["env-filter", "fmt"]
+}
+wayland-client = "0.31.15"
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+
