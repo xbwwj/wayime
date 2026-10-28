@@ -1,7 +1,8 @@
 use std::{fs, io};
 
 use anyhow::{Context as _, Result};
-use rquickjs::{Context as JsContext, Function, Module, Object, Persistent, Runtime, Value};
+use rquickjs::{Context as JsContext, Function, Module, Object, Persistent, Value};
+use rquickjs_jit::JitRuntime as Runtime;
 use tracing::debug;
 
 /// The user's optional JavaScript configuration.
@@ -30,7 +31,9 @@ impl Config {
             }
         };
 
-        let runtime = Runtime::new().context("failed to create QuickJS runtime")?;
+        let runtime = Runtime::builder()
+            .build()
+            .context("failed to create QuickJS runtime")?;
         let context = JsContext::full(&runtime).context("failed to create QuickJS context")?;
         let expand = context
             .with(|ctx| -> rquickjs::Result<Persistent<Function<'static>>> {

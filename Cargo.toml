@@ -10,7 +10,13 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 dirs = "7"
 libc = "0.2.191"
-rquickjs = "0.14.0"
+# rquickjs = "0.14.0"
+rquickjs = { package = "quickjs-jit", version = "=0.14.1" }
+rquickjs-jit = {
+    package = "quickjs-jit-runtime",
+    version = "=0.14.1",
+    features = ["compiler"],
+}
 rusqlite = { version = "0.41", features = ["bundled", "cache", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
