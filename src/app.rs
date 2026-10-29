@@ -1,3 +1,4 @@
+// src/app.rs
 use std::{
     collections::HashSet,
     num::NonZeroUsize,
@@ -37,6 +38,10 @@ const SPEECH_EVENT_POLL_MS: i32 = 25;
 // Two Ctrl+Space presses within this interval start speech recording.
 // Adjust this constant to tune how quickly the double-tap must happen.
 const CTRL_SPACE_DOUBLE_TAP_INTERVAL: Duration = Duration::from_millis(250);
+// In voice-result state, the first Space commits the transcript but defers
+// leaving voice mode briefly. A second Space within this interval restarts
+// recording with the existing SpeechWorker so the Whisper model stays resident.
+const VOICE_RESULT_SPACE_DOUBLE_TAP_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct ActiveRepeat {
     key: u32,
@@ -90,6 +95,9 @@ pub struct App {
     pub(crate) speech_worker: Option<SpeechWorker>,
     // The first Ctrl+Space is deferred briefly so a second press can trigger voice.
     pub(crate) pending_ctrl_space: Option<Instant>,
+    // After committing a voice result with Space, keep the worker alive briefly.
+    // A second Space restarts recording; timeout exits voice mode and releases GPU.
+    pub(crate) pending_voice_exit: Option<Instant>,
 }
 
 impl App {
@@ -297,6 +305,7 @@ impl App {
         self.repeat_rate = 0;
         self.enabled = false;
         self.pending_ctrl_space = None;
+        self.pending_voice_exit = None;
 
         // Dropping the worker requests shutdown and releases any active microphone
         // stream. Deactivation must not leave recording alive for another client.
@@ -411,6 +420,7 @@ impl App {
 
         // The tentative single-tap mode indicator is replaced by either the
         // recording indicator or the restored ordinary preedit if startup fails.
+        self.pending_voice_exit = None;
         self.mode_indicator = None;
         let worker = match SpeechWorker::spawn("auto") {
             Ok(worker) => worker,
@@ -436,25 +446,70 @@ impl App {
         info!("started voice recording via double Ctrl+Space");
     }
 
+    /// Restart recording without dropping SpeechWorker. This keeps the loaded
+    /// Whisper model/GPU allocation alive across consecutive voice phrases.
+    fn start_voice_recording_with_existing_worker(&mut self) {
+        if self.voice_state.is_some() {
+            return;
+        }
+
+        let result = self
+            .speech_worker
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speech worker is not available"))
+            .and_then(|worker| worker.start_recording());
+
+        if let Err(error) = result {
+            error!(%error, "could not restart voice recording");
+            self.exit_voice_mode();
+            return;
+        }
+
+        self.pending_voice_exit = None;
+        self.mode_indicator = None;
+        self.active_repeat = None;
+        self.voice_state = Some(VoiceState::Recording);
+        self.sync_preedit();
+        info!("restarted voice recording with the existing speech worker");
+    }
+
+    /// Backspace on a voice transcript discards that transcript and immediately
+    /// starts a new recording, reusing the existing worker/Recognizer.
+    fn restart_voice_recording_from_result(&mut self) {
+        if !matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
+            return;
+        }
+
+        self.voice_state = None;
+        self.pending_voice_exit = None;
+        self.active_repeat = None;
+        self.start_voice_recording_with_existing_worker();
+    }
+
     fn exit_voice_mode(&mut self) {
-        if self.voice_state.is_none() {
+        if self.voice_state.is_none() && self.speech_worker.is_none() {
+            self.pending_voice_exit = None;
             return;
         }
 
         // Dropping the session worker requests shutdown and releases an active
-        // microphone stream. The ordinary composition remains untouched.
+        // microphone stream and the loaded Whisper model/GPU resources. The
+        // ordinary composition remains untouched.
         self.voice_state = None;
         self.speech_worker = None;
+        self.pending_voice_exit = None;
         self.active_repeat = None;
         self.sync_preedit();
         info!("voice input ended; returned to normal input mode");
     }
 
-    fn commit_voice_result(&mut self) {
+    /// Commit the transcript and leave voice mode immediately. Used by Enter.
+    fn commit_voice_result_and_exit(&mut self) {
         let Some(VoiceState::Result(text)) = self.voice_state.take() else {
             return;
         };
 
+        self.pending_voice_exit = None;
         self.speech_worker = None;
         self.active_repeat = None;
         if self.active {
@@ -463,15 +518,24 @@ impl App {
             self.input_method.commit_string(text);
             self.sync_preedit();
         }
-        info!("committed voice transcript; returned to normal input mode");
+        info!("committed voice transcript; exited voice input mode");
     }
 
-    /// Discard the recognized text and return to the ordinary input state.
-    fn discard_voice_result(&mut self) {
-        if !matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
+    /// Commit the transcript but keep the worker alive briefly. A second Space
+    /// within VOICE_RESULT_SPACE_DOUBLE_TAP_INTERVAL restarts recording; timeout
+    /// exits voice mode and releases the Whisper model/GPU resources.
+    fn commit_voice_result_deferred_exit(&mut self) {
+        let Some(VoiceState::Result(text)) = self.voice_state.take() else {
             return;
+        };
+
+        self.active_repeat = None;
+        if self.active {
+            self.input_method.commit_string(text);
+            self.sync_preedit();
         }
-        self.exit_voice_mode();
+        self.pending_voice_exit = Some(Instant::now());
+        info!("committed voice transcript; waiting briefly for a double Space restart");
     }
 
     fn handle_voice_key(&mut self, time: u32, key: u32) -> bool {
@@ -481,10 +545,11 @@ impl App {
                 true
             }
             KEY_BACKSPACE => {
-                // Once a transcript is ready, Backspace discards the whole phrase.
-                // During recording/transcription it cancels the current voice task.
+                // On a ready transcript, Backspace discards the transcript and
+                // immediately records again with the same worker. A second
+                // Backspace while Recording exits voice mode.
                 if matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
-                    self.discard_voice_result();
+                    self.restart_voice_recording_from_result();
                 } else {
                     self.exit_voice_mode();
                 }
@@ -494,7 +559,7 @@ impl App {
                 match self.voice_state.as_ref() {
                     Some(VoiceState::Recording) => self.stop_voice_recording(),
                     Some(VoiceState::Transcribing) => {}
-                    Some(VoiceState::Result(_)) => self.commit_voice_result(),
+                    Some(VoiceState::Result(_)) => self.commit_voice_result_deferred_exit(),
                     None => return false,
                 }
                 true
@@ -503,7 +568,7 @@ impl App {
                 // Enter accepts a transcript just like Space, but does not stop
                 // recording early or interfere with an in-flight transcription.
                 if matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
-                    self.commit_voice_result();
+                    self.commit_voice_result_and_exit();
                 }
                 true
             }
@@ -604,6 +669,26 @@ impl App {
         // locally from the protocol's repeat_info timing, not from duplicate keydowns.
         if self.consumed_keys.contains(&key) {
             return true;
+        }
+
+        // A committed voice transcript may be waiting for a possible second
+        // Space. Intercept that before ordinary shortcut handling.
+        if self.pending_voice_exit.is_some() {
+            let plain_space = key == KEY_SPACE
+                && self.pressed_shortcut_modifiers.is_empty()
+                && !self.shift_pressed();
+
+            if plain_space {
+                self.pending_voice_exit = None;
+                self.active_repeat = None;
+                self.start_voice_recording_with_existing_worker();
+                return true;
+            }
+
+            if !Self::is_modifier_key(key) {
+                self.exit_voice_mode();
+                // Continue handling this key normally after leaving voice mode.
+            }
         }
 
         // Double-tap Ctrl+Space starts recording immediately. A single tap is
@@ -808,12 +893,19 @@ impl App {
     }
 
     /// Timeout passed to poll(): wake for key repeat, to resolve a pending single
-    /// Ctrl+Space tap, and to receive speech events while recording/transcribing.
+    /// Ctrl+Space tap, to resolve deferred voice exit, and to receive speech events.
     pub fn poll_timeout_ms(&self) -> i32 {
         let mut timeout = self.repeat_timeout_ms();
 
         if let Some(first_tap) = self.pending_ctrl_space {
             let remaining = CTRL_SPACE_DOUBLE_TAP_INTERVAL.saturating_sub(first_tap.elapsed());
+            let millis = remaining.as_nanos().saturating_add(999_999) / 1_000_000;
+            timeout = min_timeout(timeout, millis.min(i32::MAX as u128) as i32);
+        }
+
+        if let Some(first_tap) = self.pending_voice_exit {
+            let remaining =
+                VOICE_RESULT_SPACE_DOUBLE_TAP_INTERVAL.saturating_sub(first_tap.elapsed());
             let millis = remaining.as_nanos().saturating_add(999_999) / 1_000_000;
             timeout = min_timeout(timeout, millis.min(i32::MAX as u128) as i32);
         }
@@ -843,6 +935,13 @@ impl App {
             .is_some_and(|first_tap| first_tap.elapsed() >= CTRL_SPACE_DOUBLE_TAP_INTERVAL)
         {
             self.resolve_pending_ctrl_space();
+        }
+
+        if self
+            .pending_voice_exit
+            .is_some_and(|first_tap| first_tap.elapsed() >= VOICE_RESULT_SPACE_DOUBLE_TAP_INTERVAL)
+        {
+            self.exit_voice_mode();
         }
 
         let now = Instant::now();
@@ -1067,6 +1166,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                     state.voice_state = None;
                     state.speech_worker = None;
                     state.pending_ctrl_space = None;
+                    state.pending_voice_exit = None;
 
                     // The grab is created only once the compositor activates this
                     // input method for a focused text-input.

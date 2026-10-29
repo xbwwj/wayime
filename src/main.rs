@@ -1,3 +1,4 @@
+// src/main.rs
 use std::{
     collections::HashSet,
     os::fd::AsRawFd,
@@ -147,6 +148,7 @@ fn run() -> Result<()> {
         voice_state: None::<VoiceState>,
         speech_worker: None,
         pending_ctrl_space: None,
+        pending_voice_exit: None,
     };
 
     info!(
@@ -198,7 +200,8 @@ fn run() -> Result<()> {
             }
 
             // poll() timed out because a held key reached its repeat deadline, or
-            // because the app is polling for a speech worker result.
+            // because the app is polling for a speech worker result or deferred
+            // voice-mode exit.
             app.handle_repeat_tick();
         }
     }
