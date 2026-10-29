@@ -34,16 +34,18 @@ use crate::{
 };
 
 const SPEECH_EVENT_POLL_MS: i32 = 25;
+// Two Ctrl+Space presses within this interval start speech recording.
+// Adjust this constant to tune how quickly the double-tap must happen.
+const CTRL_SPACE_DOUBLE_TAP_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct ActiveRepeat {
     key: u32,
     next_at: Instant,
 }
 
-/// Voice mode is an overlay on top of the existing Chinese/English input state.
-/// Keeping the current composition untouched means leaving voice mode restores it.
+/// Speech input temporarily overlays the ordinary input state. It always starts
+/// directly in Recording; there is deliberately no idle voice-input state.
 pub(crate) enum VoiceState {
-    Ready,
     Recording,
     Transcribing,
     Result(String),
@@ -86,6 +88,8 @@ pub struct App {
 
     pub(crate) voice_state: Option<VoiceState>,
     pub(crate) speech_worker: Option<SpeechWorker>,
+    // The first Ctrl+Space is deferred briefly so a second press can trigger voice.
+    pub(crate) pending_ctrl_space: Option<Instant>,
 }
 
 impl App {
@@ -142,9 +146,8 @@ impl App {
     fn preedit_text(&self) -> String {
         if let Some(state) = self.voice_state.as_ref() {
             return match state {
-                VoiceState::Ready => "语音输入".to_owned(),
-                VoiceState::Recording => "语音输入 🔴".to_owned(),
-                VoiceState::Transcribing => "语音输入 …".to_owned(),
+                VoiceState::Recording => " 语音输入 🔴 ".to_owned(),
+                VoiceState::Transcribing => " 语音输入 … ".to_owned(),
                 VoiceState::Result(text) => text.clone(),
             };
         }
@@ -210,6 +213,31 @@ impl App {
         }
     }
 
+    /// 停止录音并等待后台 Whisper 识别完成。
+    fn stop_voice_recording(&mut self) {
+        if !matches!(self.voice_state.as_ref(), Some(VoiceState::Recording)) {
+            return;
+        }
+
+        let result = self
+            .speech_worker
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speech worker is not available"))
+            .and_then(|worker| worker.stop_recording());
+
+        if let Err(error) = result {
+            warn!(%error, "could not stop voice recording");
+            self.exit_voice_mode();
+            return;
+        }
+
+        self.voice_state = Some(VoiceState::Transcribing);
+        self.active_repeat = None;
+        self.sync_preedit();
+
+        info!("stopped voice recording; waiting for transcription");
+    }
+
     fn sync_preedit(&self) {
         if !self.active {
             return;
@@ -268,6 +296,7 @@ impl App {
         self.active_repeat = None;
         self.repeat_rate = 0;
         self.enabled = false;
+        self.pending_ctrl_space = None;
 
         // Dropping the worker requests shutdown and releases any active microphone
         // stream. Deactivation must not leave recording alive for another client.
@@ -319,23 +348,17 @@ impl App {
                 KEY_LEFT_ALT | KEY_RIGHT_ALT | KEY_LEFT_META | KEY_RIGHT_META
             )
         });
-        control && !other_modifier
+        control && !other_modifier && !self.shift_pressed()
     }
 
-    fn ctrl_shift_space_pressed(&self) -> bool {
-        let control = self.pressed_shortcut_modifiers.contains(&KEY_LEFT_CTRL)
-            || self.pressed_shortcut_modifiers.contains(&KEY_RIGHT_CTRL);
-        let other_modifier = self.pressed_shortcut_modifiers.iter().any(|key| {
-            matches!(
-                *key,
-                KEY_LEFT_ALT | KEY_RIGHT_ALT | KEY_LEFT_META | KEY_RIGHT_META
-            )
-        });
-        control && self.shift_pressed() && !other_modifier
+    fn is_modifier_key(key: u32) -> bool {
+        is_shortcut_modifier(key) || matches!(key, KEY_LEFT_SHIFT | KEY_RIGHT_SHIFT)
     }
 
-    fn show_mode_indicator(&mut self) {
-        self.mode_indicator = Some((if self.enabled { " 中 " } else { " En " }).to_owned());
+    fn show_pending_ctrl_space_indicator(&mut self) {
+        // Show the mode that a single tap will select while waiting for a
+        // possible second tap. A double tap replaces this with the recording UI.
+        self.mode_indicator = Some((if self.enabled { " En " } else { " 中 " }).to_owned());
         self.sync_preedit();
     }
 
@@ -343,7 +366,9 @@ impl App {
         self.enabled = !self.enabled;
         self.active_repeat = None;
         self.clear_composition();
-        self.show_mode_indicator();
+        self.mode_indicator = None;
+        self.sync_preedit();
+
         info!(
             enabled = self.enabled,
             mode = if self.enabled { "zh" } else { "en" },
@@ -351,23 +376,64 @@ impl App {
         );
     }
 
-    fn enter_voice_mode(&mut self) {
+    /// Resolve the first Ctrl+Space as a normal mode toggle.
+    fn resolve_pending_ctrl_space(&mut self) {
+        if self.pending_ctrl_space.take().is_some() {
+            self.toggle_enabled();
+        }
+    }
+
+    fn handle_ctrl_space_tap(&mut self) -> bool {
+        let now = Instant::now();
+
+        if let Some(first_tap) = self.pending_ctrl_space.take() {
+            if now.saturating_duration_since(first_tap) <= CTRL_SPACE_DOUBLE_TAP_INTERVAL {
+                self.active_repeat = None;
+                self.enter_voice_recording();
+                return true;
+            }
+
+            // The old tap expired; apply it as a regular toggle and treat this
+            // press as the first tap of a new possible double-tap.
+            self.toggle_enabled();
+        }
+
+        self.active_repeat = None;
+        self.pending_ctrl_space = Some(now);
+        self.show_pending_ctrl_space_indicator();
+        true
+    }
+
+    fn enter_voice_recording(&mut self) {
         if self.voice_state.is_some() {
             return;
         }
 
-        match SpeechWorker::spawn("auto") {
-            Ok(worker) => self.speech_worker = Some(worker),
+        // The tentative single-tap mode indicator is replaced by either the
+        // recording indicator or the restored ordinary preedit if startup fails.
+        self.mode_indicator = None;
+        let worker = match SpeechWorker::spawn("auto") {
+            Ok(worker) => worker,
             Err(error) => {
                 error!(%error, "could not create speech worker");
+                self.sync_preedit();
                 return;
             }
+        };
+
+        if let Err(error) = worker.start_recording() {
+            error!(%error, "could not start voice recording");
+            drop(worker);
+            self.sync_preedit();
+            return;
         }
 
+        self.mode_indicator = None;
         self.active_repeat = None;
-        self.voice_state = Some(VoiceState::Ready);
+        self.speech_worker = Some(worker);
+        self.voice_state = Some(VoiceState::Recording);
         self.sync_preedit();
-        info!("entered voice input mode");
+        info!("started voice recording via double Ctrl+Space");
     }
 
     fn exit_voice_mode(&mut self) {
@@ -375,45 +441,13 @@ impl App {
             return;
         }
 
-        // Dropping the session worker cancels active recording. A transcription
-        // already in progress finishes in the background, but its receiver is gone.
+        // Dropping the session worker requests shutdown and releases an active
+        // microphone stream. The ordinary composition remains untouched.
         self.voice_state = None;
         self.speech_worker = None;
         self.active_repeat = None;
         self.sync_preedit();
-        info!("exited voice input mode");
-    }
-
-    fn start_voice_recording(&mut self) {
-        let Some(worker) = self.speech_worker.as_ref() else {
-            self.voice_state = Some(VoiceState::Ready);
-            self.sync_preedit();
-            return;
-        };
-
-        if let Err(error) = worker.start_recording() {
-            warn!(%error, "could not request voice recording");
-            self.voice_state = Some(VoiceState::Ready);
-        } else {
-            self.voice_state = Some(VoiceState::Recording);
-        }
-        self.sync_preedit();
-    }
-
-    fn stop_voice_recording(&mut self) {
-        let Some(worker) = self.speech_worker.as_ref() else {
-            self.voice_state = Some(VoiceState::Ready);
-            self.sync_preedit();
-            return;
-        };
-
-        if let Err(error) = worker.stop_recording() {
-            warn!(%error, "could not request voice transcription");
-            self.voice_state = Some(VoiceState::Ready);
-        } else {
-            self.voice_state = Some(VoiceState::Transcribing);
-        }
-        self.sync_preedit();
+        info!("voice input ended; returned to normal input mode");
     }
 
     fn commit_voice_result(&mut self) {
@@ -421,14 +455,23 @@ impl App {
             return;
         };
 
-        // Restore the voice-mode prompt as the next preedit while committing the
-        // transcript. Do not clear the user's prior pinyin composition or toggle
-        // their original Chinese/English mode.
-        self.voice_state = Some(VoiceState::Ready);
+        self.speech_worker = None;
+        self.active_repeat = None;
         if self.active {
+            // Commit the recognized text and restore whichever ordinary preedit
+            // (if any) was active before speech input began.
             self.input_method.commit_string(text);
             self.sync_preedit();
         }
+        info!("committed voice transcript; returned to normal input mode");
+    }
+
+    /// Discard the recognized text and return to the ordinary input state.
+    fn discard_voice_result(&mut self) {
+        if !matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
+            return;
+        }
+        self.exit_voice_mode();
     }
 
     fn handle_voice_key(&mut self, time: u32, key: u32) -> bool {
@@ -438,40 +481,37 @@ impl App {
                 true
             }
             KEY_BACKSPACE => {
-                // Backspace clears a recognized phrase as one whole segment. A
-                // following Backspace, now in Ready, leaves voice mode entirely.
+                // Once a transcript is ready, Backspace discards the whole phrase.
+                // During recording/transcription it cancels the current voice task.
                 if matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
-                    self.voice_state = Some(VoiceState::Ready);
-                    self.sync_preedit();
-                } else if self.voice_state.is_some() {
+                    self.discard_voice_result();
+                } else {
                     self.exit_voice_mode();
                 }
                 true
             }
             KEY_SPACE => {
-                let state = match self.voice_state.as_ref() {
-                    Some(VoiceState::Ready) => 0,
-                    Some(VoiceState::Recording) => 1,
-                    Some(VoiceState::Transcribing) => 2,
-                    Some(VoiceState::Result(_)) => 3,
-                    None => 4,
-                };
-                match state {
-                    0 => self.start_voice_recording(),
-                    1 => self.stop_voice_recording(),
-                    2 => {}
-                    3 => self.commit_voice_result(),
-                    _ => return false,
+                match self.voice_state.as_ref() {
+                    Some(VoiceState::Recording) => self.stop_voice_recording(),
+                    Some(VoiceState::Transcribing) => {}
+                    Some(VoiceState::Result(_)) => self.commit_voice_result(),
+                    None => return false,
+                }
+                true
+            }
+            KEY_ENTER => {
+                // Enter accepts a transcript just like Space, but does not stop
+                // recording early or interfere with an in-flight transcription.
+                if matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
+                    self.commit_voice_result();
                 }
                 true
             }
             _ if is_printable_evdev_key(key) => {
-                // Voice mode owns printable keys so accidental typing cannot leak
-                // into the focused application while the prompt is displayed.
+                // Keep accidental typing from leaking into the focused application.
                 true
             }
             _ => {
-                // Keep navigation and other non-printable keys available to the app.
                 self.forward_key(time, key, KEY_PRESSED);
                 false
             }
@@ -500,20 +540,16 @@ impl App {
 
                     if text.trim().is_empty() {
                         warn!("voice recognition returned no text");
-                        self.voice_state = Some(VoiceState::Ready);
+                        self.exit_voice_mode();
                     } else {
                         self.voice_state = Some(VoiceState::Result(text));
+                        self.sync_preedit();
                     }
-                    self.sync_preedit();
                 }
                 SpeechEvent::Error(message) => {
                     warn!(error = %message, "voice input failed");
-                    if matches!(
-                        self.voice_state.as_ref(),
-                        Some(VoiceState::Recording) | Some(VoiceState::Transcribing)
-                    ) {
-                        self.voice_state = Some(VoiceState::Ready);
-                        self.sync_preedit();
+                    if self.voice_state.is_some() {
+                        self.exit_voice_mode();
                     }
                 }
             }
@@ -557,6 +593,7 @@ impl App {
     /// Handle one keyboard event. Returns true if this physical key press is consumed
     /// by the input method; its release will be consumed as well.
     fn handle_key_press(&mut self, time: u32, key: u32) -> bool {
+        eprintln!("handle_key_press: key={key}");
         // The keyboard grab is scoped to activate/deactivate. Events from a stale
         // grab must never be injected into whichever client happens to be focused.
         if !self.active {
@@ -569,28 +606,29 @@ impl App {
             return true;
         }
 
-        // This combination must be checked before Ctrl+Space: Shift+Ctrl+Space
-        // enters voice mode instead of toggling the Chinese/English mode.
-        if key == KEY_SPACE && self.ctrl_shift_space_pressed() {
-            self.enter_voice_mode();
-            return true;
+        // Double-tap Ctrl+Space starts recording immediately. A single tap is
+        // deferred for a very short interval so it can still toggle the IME.
+        let toggle_shortcut =
+            (key == KEY_SPACE && self.ctrl_space_pressed()) || key == KEY_XF86_KEYBOARD;
+
+        if toggle_shortcut && self.voice_state.is_none() {
+            return self.handle_ctrl_space_tap();
         }
 
-        // While voice mode is active, the original input mode is suspended. Other
-        // modifier shortcuts are passed through, while voice keys go to its state machine.
+        // Modifier key-downs can be part of the second Ctrl+Space tap, so do not
+        // resolve a pending first tap until another non-modifier key is pressed.
+        if self.pending_ctrl_space.is_some() && !Self::is_modifier_key(key) {
+            self.resolve_pending_ctrl_space();
+        }
+
+        // During speech input, the ordinary input state is suspended. Modifier
+        // shortcuts are passed through; Space/Backspace/Enter act on the transcript.
         if self.voice_state.is_some() {
             if !self.pressed_shortcut_modifiers.is_empty() {
                 self.forward_key(time, key, KEY_PRESSED);
                 return false;
             }
             return self.handle_voice_key(time, key);
-        }
-
-        // Ctrl+Space toggles IME processing. Other Ctrl/Alt/Super combinations
-        // are forwarded unchanged to the focused application.
-        if key == KEY_SPACE && self.ctrl_space_pressed() {
-            self.toggle_enabled();
-            return true;
         }
 
         if !self.pressed_shortcut_modifiers.is_empty() {
@@ -769,19 +807,22 @@ impl App {
         );
     }
 
-    /// Timeout passed to poll(): wake for key repeat, and poll speech results while
-    /// voice mode is active. Audio capture and model inference run on another thread.
+    /// Timeout passed to poll(): wake for key repeat, to resolve a pending single
+    /// Ctrl+Space tap, and to receive speech events while recording/transcribing.
     pub fn poll_timeout_ms(&self) -> i32 {
-        let repeat_timeout = self.repeat_timeout_ms();
-        if self.voice_state.is_none() {
-            return repeat_timeout;
+        let mut timeout = self.repeat_timeout_ms();
+
+        if let Some(first_tap) = self.pending_ctrl_space {
+            let remaining = CTRL_SPACE_DOUBLE_TAP_INTERVAL.saturating_sub(first_tap.elapsed());
+            let millis = remaining.as_nanos().saturating_add(999_999) / 1_000_000;
+            timeout = min_timeout(timeout, millis.min(i32::MAX as u128) as i32);
         }
 
-        if repeat_timeout < 0 {
-            SPEECH_EVENT_POLL_MS
-        } else {
-            repeat_timeout.min(SPEECH_EVENT_POLL_MS)
+        if self.voice_state.is_some() {
+            timeout = min_timeout(timeout, SPEECH_EVENT_POLL_MS);
         }
+
+        timeout
     }
 
     /// Timeout passed to poll(): wake when the currently held key is due to repeat.
@@ -797,6 +838,13 @@ impl App {
     /// Execute one repeat tick. Repeated letters extend the code; repeated
     /// Backspace removes one character. Candidate searches run synchronously.
     pub fn handle_repeat_tick(&mut self) {
+        if self
+            .pending_ctrl_space
+            .is_some_and(|first_tap| first_tap.elapsed() >= CTRL_SPACE_DOUBLE_TAP_INTERVAL)
+        {
+            self.resolve_pending_ctrl_space();
+        }
+
         let now = Instant::now();
         let key = {
             let Some(repeat) = &mut self.active_repeat else {
@@ -847,6 +895,14 @@ impl App {
 
     fn shift_pressed(&self) -> bool {
         !self.pressed_shift_keys.is_empty()
+    }
+}
+
+fn min_timeout(current: i32, candidate: i32) -> i32 {
+    if current < 0 {
+        candidate
+    } else {
+        current.min(candidate)
     }
 }
 
@@ -1010,6 +1066,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                     state.enabled = false;
                     state.voice_state = None;
                     state.speech_worker = None;
+                    state.pending_ctrl_space = None;
 
                     // The grab is created only once the compositor activates this
                     // input method for a focused text-input.
@@ -1095,7 +1152,7 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
                     if consumed {
                         state.consumed_keys.insert(key);
                     }
-                    // A Backspace that exits voice mode must not start ordinary
+                    // A key that ends voice input must not start ordinary
                     // IME key-repeat after the state transition has completed.
                     if !was_down && !was_voice_mode {
                         state.start_key_repeat(key, consumed);
@@ -1117,7 +1174,11 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
 
                     // Keep the mode indicator visible while Space is held, then
                     // clear it immediately on keyup (no timer or polling deadline).
-                    if key == KEY_SPACE && state.mode_indicator.take().is_some() {
+
+                    if matches!(key, KEY_SPACE | KEY_XF86_KEYBOARD)
+                        && state.pending_ctrl_space.is_none()
+                        && state.mode_indicator.take().is_some()
+                    {
                         state.sync_preedit();
                     }
                 } else {
@@ -1151,4 +1212,3 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
         }
     }
 }
-

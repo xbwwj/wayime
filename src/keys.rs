@@ -18,3 +18,4 @@ pub const KEY_PRESSED: u32 = 1;
 pub const KEY_RELEASED: u32 = 0;
 pub const KEYMAP_XKB_V1: u32 = 1;
 pub const MAX_PREEDIT_BYTES: usize = 3500;
+pub const KEY_XF86_KEYBOARD: u32 = 374;

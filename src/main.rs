@@ -146,13 +146,14 @@ fn run() -> Result<()> {
         expanded_candidate: None,
         voice_state: None::<VoiceState>,
         speech_worker: None,
+        pending_ctrl_space: None,
     };
 
     info!(
         dict = %dict_path.display(),
         page_size = app.page_size,
         repeat_support = true,
-        "wayime started; Ctrl+Space toggles IME, Ctrl+Shift+Space enters voice input, '-'/'=' change candidate page"
+        "wayime started; single Ctrl+Space toggles IME, double Ctrl+Space starts voice input, '-'/'=' change candidate page"
     );
 
     while !app.unavailable {
