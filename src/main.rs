@@ -1,4 +1,3 @@
-// src/main.rs
 use std::{
     collections::HashSet,
     os::fd::AsRawFd,
@@ -10,7 +9,9 @@ use clap::Parser;
 use engine::Engine;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use wayland_client::{globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection};
+use wayland_client::{
+    backend::WaylandError, globals::registry_queue_init, protocol::wl_seat::WlSeat, Connection,
+};
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -161,7 +162,14 @@ fn run() -> Result<()> {
     while !app.unavailable {
         event_queue.dispatch_pending(&mut app)?;
         app.poll_speech_events();
-        event_queue.flush()?;
+
+        // flush() 是非阻塞的：内核输出缓冲区暂时满时会返回 WouldBlock。
+        // 这是预期内的可恢复状态，请求仍留在队列里，下一轮循环再试即可。
+        if let Err(error) = event_queue.flush() {
+            if !is_would_block(&error) {
+                return Err(error).context("flushing Wayland connection");
+            }
+        }
 
         let Some(read_guard) = event_queue.prepare_read() else {
             // Events arrived between dispatch_pending and prepare_read.
@@ -182,7 +190,13 @@ fn run() -> Result<()> {
                 != 0;
 
             if wayland_ready {
-                read_guard.read()?;
+                // read() 同样是非阻塞的：poll 之后事件可能已被内部消耗，
+                // 或只到达了部分数据，此时返回 WouldBlock 属于正常情况。
+                if let Err(error) = read_guard.read() {
+                    if !is_would_block(&error) {
+                        return Err(error).context("reading Wayland events");
+                    }
+                }
             } else {
                 drop(read_guard);
             }
@@ -207,4 +221,13 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Wayland 客户端 socket 是非阻塞的，`WouldBlock` 表示“现在没数据 / 写不进去”，
+/// 应当稍后重试，而不是当作连接错误终止进程。
+fn is_would_block(error: &WaylandError) -> bool {
+    match error {
+        WaylandError::Io(io) => io.kind() == std::io::ErrorKind::WouldBlock,
+        _ => false,
+    }
 }
