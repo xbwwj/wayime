@@ -24,6 +24,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
+
+    Transcribe {
+        /// Language code: zh, en, ja, or auto.
+        #[arg(long, default_value = "auto")]
+        language: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

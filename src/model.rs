@@ -1,10 +1,32 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use hf_hub::HFClientSync;
 
 const REPOSITORY_OWNER: &str = "ggerganov";
 const REPOSITORY_NAME: &str = "whisper.cpp";
 const REPOSITORY_ID: &str = "ggerganov/whisper.cpp";
-const MODEL_FILENAME: &str = "ggml-base-q5_1.bin";
+const MODEL_FILENAME: &str = "ggml-small-q5_1.bin";
+
+/// 只查询本地缓存，不下载模型。
+pub fn downloaded_path() -> Result<PathBuf> {
+    let client = HFClientSync::new().context("failed to initialize Hugging Face client")?;
+
+    let cache = client
+        .scan_cache()
+        .send()
+        .context("failed to scan Hugging Face model cache")?;
+
+    cache
+        .repos
+        .iter()
+        .filter(|repo| repo.repo_type == "model" && repo.repo_id == REPOSITORY_ID)
+        .flat_map(|repo| repo.revisions.iter())
+        .flat_map(|revision| revision.files.iter())
+        .find(|file| file.file_name == MODEL_FILENAME && file.file_path.is_file())
+        .map(|file| file.file_path.clone())
+        .context("Whisper model is not downloaded; run `wayime model download` first")
+}
 
 /// Show whether the configured Whisper model is present in the local cache.
 pub fn show() -> Result<()> {

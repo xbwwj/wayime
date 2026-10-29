@@ -30,11 +30,23 @@ use crate::{
     config::Config,
     engine::{Engine, Query},
     keys::*,
+    speech::{SpeechEvent, SpeechWorker},
 };
+
+const SPEECH_EVENT_POLL_MS: i32 = 25;
 
 pub struct ActiveRepeat {
     key: u32,
     next_at: Instant,
+}
+
+/// Voice mode is an overlay on top of the existing Chinese/English input state.
+/// Keeping the current composition untouched means leaving voice mode restores it.
+pub(crate) enum VoiceState {
+    Ready,
+    Recording,
+    Transcribing,
+    Result(String),
 }
 
 pub struct App {
@@ -71,6 +83,9 @@ pub struct App {
     pub active_repeat: Option<ActiveRepeat>,
     // XXX: should not be passed this way.
     pub expanded_candidate: Option<String>,
+
+    pub(crate) voice_state: Option<VoiceState>,
+    pub(crate) speech_worker: Option<SpeechWorker>,
 }
 
 impl App {
@@ -125,6 +140,15 @@ impl App {
     }
 
     fn preedit_text(&self) -> String {
+        if let Some(state) = self.voice_state.as_ref() {
+            return match state {
+                VoiceState::Ready => "语音输入".to_owned(),
+                VoiceState::Recording => "语音输入 🔴".to_owned(),
+                VoiceState::Transcribing => "语音输入 …".to_owned(),
+                VoiceState::Result(text) => text.clone(),
+            };
+        }
+
         if let Some(indicator) = &self.mode_indicator {
             return indicator.clone();
         }
@@ -191,17 +215,17 @@ impl App {
             return;
         }
         let text = self.preedit_text();
-        // Cursor offsets are UTF-8 byte offsets. Only the logical input portion
-        // (the composition code) is covered; candidate labels and paging arrows
-        // are presentation-only text and must not be part of the cursor range.
+        // Cursor offsets are UTF-8 byte offsets. In voice mode the displayed
+        // label or recognized transcript is the complete logical preedit.
         let (cursor_begin, cursor_end) = if text.is_empty() {
             (-1, -1)
-        } else if self.mode_indicator.is_some() {
-            // The temporary mode indicator is the only preedit while visible.
+        } else if self.voice_state.is_some() || self.mode_indicator.is_some() {
             (0, text.len() as i32)
         } else if self.composing.is_empty() {
             (0, text.len() as i32)
         } else {
+            // Candidate labels and paging arrows are presentation-only text and
+            // must not be part of the cursor range.
             (0, self.composing.len() as i32)
         };
         self.input_method
@@ -244,6 +268,11 @@ impl App {
         self.active_repeat = None;
         self.repeat_rate = 0;
         self.enabled = false;
+
+        // Dropping the worker requests shutdown and releases any active microphone
+        // stream. Deactivation must not leave recording alive for another client.
+        self.voice_state = None;
+        self.speech_worker = None;
 
         // Send release/destroy immediately on deactivation so the compositor
         // can restore normal keyboard routing for the newly focused client.
@@ -293,6 +322,18 @@ impl App {
         control && !other_modifier
     }
 
+    fn ctrl_shift_space_pressed(&self) -> bool {
+        let control = self.pressed_shortcut_modifiers.contains(&KEY_LEFT_CTRL)
+            || self.pressed_shortcut_modifiers.contains(&KEY_RIGHT_CTRL);
+        let other_modifier = self.pressed_shortcut_modifiers.iter().any(|key| {
+            matches!(
+                *key,
+                KEY_LEFT_ALT | KEY_RIGHT_ALT | KEY_LEFT_META | KEY_RIGHT_META
+            )
+        });
+        control && self.shift_pressed() && !other_modifier
+    }
+
     fn show_mode_indicator(&mut self) {
         self.mode_indicator = Some((if self.enabled { " 中 " } else { " En " }).to_owned());
         self.sync_preedit();
@@ -308,6 +349,175 @@ impl App {
             mode = if self.enabled { "zh" } else { "en" },
             "input mode changed"
         );
+    }
+
+    fn enter_voice_mode(&mut self) {
+        if self.voice_state.is_some() {
+            return;
+        }
+
+        match SpeechWorker::spawn("auto") {
+            Ok(worker) => self.speech_worker = Some(worker),
+            Err(error) => {
+                error!(%error, "could not create speech worker");
+                return;
+            }
+        }
+
+        self.active_repeat = None;
+        self.voice_state = Some(VoiceState::Ready);
+        self.sync_preedit();
+        info!("entered voice input mode");
+    }
+
+    fn exit_voice_mode(&mut self) {
+        if self.voice_state.is_none() {
+            return;
+        }
+
+        // Dropping the session worker cancels active recording. A transcription
+        // already in progress finishes in the background, but its receiver is gone.
+        self.voice_state = None;
+        self.speech_worker = None;
+        self.active_repeat = None;
+        self.sync_preedit();
+        info!("exited voice input mode");
+    }
+
+    fn start_voice_recording(&mut self) {
+        let Some(worker) = self.speech_worker.as_ref() else {
+            self.voice_state = Some(VoiceState::Ready);
+            self.sync_preedit();
+            return;
+        };
+
+        if let Err(error) = worker.start_recording() {
+            warn!(%error, "could not request voice recording");
+            self.voice_state = Some(VoiceState::Ready);
+        } else {
+            self.voice_state = Some(VoiceState::Recording);
+        }
+        self.sync_preedit();
+    }
+
+    fn stop_voice_recording(&mut self) {
+        let Some(worker) = self.speech_worker.as_ref() else {
+            self.voice_state = Some(VoiceState::Ready);
+            self.sync_preedit();
+            return;
+        };
+
+        if let Err(error) = worker.stop_recording() {
+            warn!(%error, "could not request voice transcription");
+            self.voice_state = Some(VoiceState::Ready);
+        } else {
+            self.voice_state = Some(VoiceState::Transcribing);
+        }
+        self.sync_preedit();
+    }
+
+    fn commit_voice_result(&mut self) {
+        let Some(VoiceState::Result(text)) = self.voice_state.take() else {
+            return;
+        };
+
+        // Restore the voice-mode prompt as the next preedit while committing the
+        // transcript. Do not clear the user's prior pinyin composition or toggle
+        // their original Chinese/English mode.
+        self.voice_state = Some(VoiceState::Ready);
+        if self.active {
+            self.input_method.commit_string(text);
+            self.sync_preedit();
+        }
+    }
+
+    fn handle_voice_key(&mut self, time: u32, key: u32) -> bool {
+        match key {
+            KEY_ESC => {
+                self.exit_voice_mode();
+                true
+            }
+            KEY_BACKSPACE => {
+                // Backspace clears a recognized phrase as one whole segment. A
+                // following Backspace, now in Ready, leaves voice mode entirely.
+                if matches!(self.voice_state.as_ref(), Some(VoiceState::Result(_))) {
+                    self.voice_state = Some(VoiceState::Ready);
+                    self.sync_preedit();
+                } else if self.voice_state.is_some() {
+                    self.exit_voice_mode();
+                }
+                true
+            }
+            KEY_SPACE => {
+                let state = match self.voice_state.as_ref() {
+                    Some(VoiceState::Ready) => 0,
+                    Some(VoiceState::Recording) => 1,
+                    Some(VoiceState::Transcribing) => 2,
+                    Some(VoiceState::Result(_)) => 3,
+                    None => 4,
+                };
+                match state {
+                    0 => self.start_voice_recording(),
+                    1 => self.stop_voice_recording(),
+                    2 => {}
+                    3 => self.commit_voice_result(),
+                    _ => return false,
+                }
+                true
+            }
+            _ if is_printable_evdev_key(key) => {
+                // Voice mode owns printable keys so accidental typing cannot leak
+                // into the focused application while the prompt is displayed.
+                true
+            }
+            _ => {
+                // Keep navigation and other non-printable keys available to the app.
+                self.forward_key(time, key, KEY_PRESSED);
+                false
+            }
+        }
+    }
+
+    /// Drain speech events without blocking the Wayland dispatch loop.
+    pub fn poll_speech_events(&mut self) {
+        let mut pending = Vec::new();
+        if let Some(worker) = self.speech_worker.as_ref() {
+            loop {
+                match worker.try_recv() {
+                    Ok(event) => pending.push(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
+        for event in pending {
+            match event {
+                SpeechEvent::Transcript(text) => {
+                    if !matches!(self.voice_state.as_ref(), Some(VoiceState::Transcribing)) {
+                        continue;
+                    }
+
+                    if text.trim().is_empty() {
+                        warn!("voice recognition returned no text");
+                        self.voice_state = Some(VoiceState::Ready);
+                    } else {
+                        self.voice_state = Some(VoiceState::Result(text));
+                    }
+                    self.sync_preedit();
+                }
+                SpeechEvent::Error(message) => {
+                    warn!(error = %message, "voice input failed");
+                    if matches!(
+                        self.voice_state.as_ref(),
+                        Some(VoiceState::Recording) | Some(VoiceState::Transcribing)
+                    ) {
+                        self.voice_state = Some(VoiceState::Ready);
+                        self.sync_preedit();
+                    }
+                }
+            }
+        }
     }
 
     fn page_previous(&mut self) {
@@ -357,6 +567,23 @@ impl App {
         // locally from the protocol's repeat_info timing, not from duplicate keydowns.
         if self.consumed_keys.contains(&key) {
             return true;
+        }
+
+        // This combination must be checked before Ctrl+Space: Shift+Ctrl+Space
+        // enters voice mode instead of toggling the Chinese/English mode.
+        if key == KEY_SPACE && self.ctrl_shift_space_pressed() {
+            self.enter_voice_mode();
+            return true;
+        }
+
+        // While voice mode is active, the original input mode is suspended. Other
+        // modifier shortcuts are passed through, while voice keys go to its state machine.
+        if self.voice_state.is_some() {
+            if !self.pressed_shortcut_modifiers.is_empty() {
+                self.forward_key(time, key, KEY_PRESSED);
+                return false;
+            }
+            return self.handle_voice_key(time, key);
         }
 
         // Ctrl+Space toggles IME processing. Other Ctrl/Alt/Super combinations
@@ -503,6 +730,7 @@ impl App {
             || self.repeat_rate == 0
             || !self.enabled
             || self.mode_indicator.is_some()
+            || self.voice_state.is_some()
             || !(evdev_letter(key).is_some() || key == KEY_BACKSPACE)
         {
             return;
@@ -541,6 +769,21 @@ impl App {
         );
     }
 
+    /// Timeout passed to poll(): wake for key repeat, and poll speech results while
+    /// voice mode is active. Audio capture and model inference run on another thread.
+    pub fn poll_timeout_ms(&self) -> i32 {
+        let repeat_timeout = self.repeat_timeout_ms();
+        if self.voice_state.is_none() {
+            return repeat_timeout;
+        }
+
+        if repeat_timeout < 0 {
+            SPEECH_EVENT_POLL_MS
+        } else {
+            repeat_timeout.min(SPEECH_EVENT_POLL_MS)
+        }
+    }
+
     /// Timeout passed to poll(): wake when the currently held key is due to repeat.
     pub fn repeat_timeout_ms(&self) -> i32 {
         let Some(repeat) = &self.active_repeat else {
@@ -572,6 +815,7 @@ impl App {
         if !self.active
             || !self.enabled
             || self.mode_indicator.is_some()
+            || self.voice_state.is_some()
             || !self.pressed_shortcut_modifiers.is_empty()
         {
             self.active_repeat = None;
@@ -764,6 +1008,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                     state.consumed_keys.clear();
                     state.keymap_ready = false;
                     state.enabled = false;
+                    state.voice_state = None;
+                    state.speech_worker = None;
 
                     // The grab is created only once the compositor activates this
                     // input method for a focused text-input.
@@ -844,11 +1090,14 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
                         state.pressed_shift_keys.insert(key);
                     }
                     let was_down = state.consumed_keys.contains(&key);
+                    let was_voice_mode = state.voice_state.is_some();
                     let consumed = state.handle_key_press(time, key);
                     if consumed {
                         state.consumed_keys.insert(key);
                     }
-                    if !was_down {
+                    // A Backspace that exits voice mode must not start ordinary
+                    // IME key-repeat after the state transition has completed.
+                    if !was_down && !was_voice_mode {
                         state.start_key_repeat(key, consumed);
                     }
                 } else if key_state == KEY_RELEASED {
@@ -902,3 +1151,4 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
         }
     }
 }
+

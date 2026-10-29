@@ -28,3 +28,6 @@ tracing-subscriber = {
 }
 wayland-client = "0.31.15"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+
+cpal = "0.18"
+whisper-rs = { version = "0.16", default-features = false, features = ["vulkan"] }

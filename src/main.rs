@@ -16,7 +16,7 @@ use wayland_protocols_misc::{
 };
 
 use crate::{
-    app::App,
+    app::{App, VoiceState},
     cli::{Args, Command, ModelCommand},
     config::Config,
     utils::{default_cache_path, default_dict_path},
@@ -29,6 +29,7 @@ mod engine;
 mod error;
 mod keys;
 mod model;
+mod speech;
 mod utils;
 
 fn main() {
@@ -65,6 +66,10 @@ fn run() -> Result<()> {
             command: ModelCommand::Download,
         }) => {
             return model::download();
+        }
+        Some(Command::Transcribe { language }) => {
+            let model_path = model::downloaded_path()?;
+            return speech::run(&model_path, language);
         }
         None => {}
     }
@@ -139,17 +144,20 @@ fn run() -> Result<()> {
         repeat_delay: Duration::ZERO,
         active_repeat: None,
         expanded_candidate: None,
+        voice_state: None::<VoiceState>,
+        speech_worker: None,
     };
 
     info!(
         dict = %dict_path.display(),
         page_size = app.page_size,
         repeat_support = true,
-        "wayime started; Ctrl+Space toggles IME, '-'/'=' change candidate page"
+        "wayime started; Ctrl+Space toggles IME, Ctrl+Shift+Space enters voice input, '-'/'=' change candidate page"
     );
 
     while !app.unavailable {
         event_queue.dispatch_pending(&mut app)?;
+        app.poll_speech_events();
         event_queue.flush()?;
 
         let Some(read_guard) = event_queue.prepare_read() else {
@@ -163,7 +171,7 @@ fn run() -> Result<()> {
             revents: 0,
         };
 
-        let poll_result = unsafe { libc::poll(&mut descriptor, 1, app.repeat_timeout_ms()) };
+        let poll_result = unsafe { libc::poll(&mut descriptor, 1, app.poll_timeout_ms()) };
 
         if poll_result > 0 {
             let wayland_ready = descriptor.revents
@@ -188,7 +196,8 @@ fn run() -> Result<()> {
                 return Err(error).context("polling Wayland connection");
             }
 
-            // poll() timed out because a held key reached its repeat deadline.
+            // poll() timed out because a held key reached its repeat deadline, or
+            // because the app is polling for a speech worker result.
             app.handle_repeat_tick();
         }
     }
