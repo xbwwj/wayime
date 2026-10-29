@@ -10,6 +10,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     FromSample, SampleFormat, SizedSample, I24, U24,
 };
+use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use tracing::{debug, warn};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -17,14 +18,16 @@ const RECORD_SECONDS: u64 = 10;
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const RECORDING_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Whisper.cpp 的识别封装。
+/// Whisper.cpp 的识别封装，内置繁转简（T2S）后处理。
 pub struct Recognizer {
     context: WhisperContext,
     language: Option<String>,
+    // 繁体 → 简体转换器，词典内嵌，无需外部文件。
+    opencc: OpenCC,
 }
 
 impl Recognizer {
-    /// 加载 Whisper GGML 模型。
+    /// 加载 Whisper GGML 模型，并初始化繁简转换器。
     ///
     /// language 使用 ISO 639-1 语言代码，例如 "zh"、"en"；
     /// 使用 "auto" 时自动识别语言。
@@ -43,10 +46,19 @@ impl Recognizer {
             Some(language.to_owned())
         };
 
-        Ok(Self { context, language })
+        // BuiltinConfig::T2s 表示繁体 → 简体，词典由库内嵌。
+        let opencc = OpenCC::from_config(BuiltinConfig::T2s)
+            .context("failed to initialize OpenCC T2s converter")?;
+
+        Ok(Self {
+            context,
+            language,
+            opencc,
+        })
     }
 
-    /// 对完整的 16 kHz、单声道 f32 PCM 音频执行一次整体识别。
+    /// 对完整的 16 kHz、单声道 f32 PCM 音频执行识别，
+    /// 并在返回前将识别结果从繁体转换为简体。
     pub fn transcribe(&self, audio: &[f32]) -> Result<String> {
         if audio.is_empty() {
             bail!("audio buffer is empty");
@@ -82,9 +94,18 @@ impl Recognizer {
             text.push_str(&segment.to_string());
         }
 
-        Ok(text.trim().to_owned())
+        // Whisper 对中文通常输出繁体；这里统一转为简体再返回。
+        let traditional = text.trim();
+        let simplified = self.opencc.convert(traditional);
+
+        Ok(simplified)
     }
 }
+
+// ---------------------------------------------------------------------------
+// 以下 SpeechEvent / SpeechCommand / SpeechWorker 等类型与原有实现完全一致，
+// 无需任何改动。
+// ---------------------------------------------------------------------------
 
 /// 输入法里的语音识别事件。录音和推理都在后台线程中完成。
 pub enum SpeechEvent {
@@ -162,8 +183,7 @@ fn speech_worker_loop(
     let mut recognizer: Option<Recognizer> = None;
 
     loop {
-        // CPAL delivers samples independently. Drain its channel frequently so it
-        // does not grow without bound while the user holds Space to record.
+        // CPAL 独立投递样本。录音期间频繁排空通道，防止无界增长。
         let recording_error = recording
             .as_mut()
             .and_then(|current| current.collect_available().err());
@@ -249,7 +269,7 @@ fn speech_worker_loop(
         }
     }
 
-    // Dropping a recording also drops its CPAL stream and stops microphone capture.
+    // 丢弃 recording 也会丢弃 CPAL stream，停止麦克风采集。
     drop(recording);
 }
 
@@ -324,7 +344,6 @@ impl StreamingRecording {
     }
 
     fn finish(mut self) -> Result<Vec<f32>> {
-        // Stop the callback before draining the final queued chunks.
         if let Some(stream) = self.stream.take() {
             let _ = stream.pause();
             drop(stream);
@@ -376,7 +395,6 @@ where
                     .collect();
 
                 if !mono.is_empty() {
-                    // 音频回调只提交采样块，不执行模型推理。
                     let _ = samples_tx.send(mono);
                 }
             },
@@ -477,7 +495,6 @@ fn record_audio() -> Result<Vec<f32>> {
         .play()
         .context("failed to start microphone recording")?;
 
-    // 收够准确的采样点数，同时为设备初始化/丢失数据留出超时保护。
     let deadline = Instant::now() + Duration::from_secs(RECORD_SECONDS + 5);
 
     while audio.len() < target_samples {
@@ -508,7 +525,6 @@ fn record_audio() -> Result<Vec<f32>> {
         }
     }
 
-    // 最后一个回调可能多送了几个采样点。
     audio.truncate(target_samples);
     drop(stream);
 
@@ -570,4 +586,3 @@ pub fn run(model_path: &Path, language: &str) -> Result<()> {
 
     Ok(())
 }
-
