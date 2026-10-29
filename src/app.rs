@@ -154,8 +154,8 @@ impl App {
     fn preedit_text(&self) -> String {
         if let Some(state) = self.voice_state.as_ref() {
             return match state {
-                VoiceState::Recording => " 语音输入 🔴 ".to_owned(),
-                VoiceState::Transcribing => " 语音输入 … ".to_owned(),
+                VoiceState::Recording => " 🎤 录音中... ".to_owned(),
+                VoiceState::Transcribing => " ✍️ 识别中... ".to_owned(),
                 VoiceState::Result(text) => text.clone(),
             };
         }
