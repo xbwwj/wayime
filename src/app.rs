@@ -658,7 +658,7 @@ impl App {
     /// Handle one keyboard event. Returns true if this physical key press is consumed
     /// by the input method; its release will be consumed as well.
     fn handle_key_press(&mut self, time: u32, key: u32) -> bool {
-        eprintln!("handle_key_press: key={key}");
+        // eprintln!("handle_key_press: key={key}");
         // The keyboard grab is scoped to activate/deactivate. Events from a stale
         // grab must never be injected into whichever client happens to be focused.
         if !self.active {
