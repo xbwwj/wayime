@@ -104,6 +104,7 @@ impl App {
     /// Start a fresh exact-code query and load its first page.
     fn refresh_candidates(&mut self) {
         self.query = None;
+        self.expanded_candidate = None;
 
         if self.composing.is_empty() || !self.active || !self.enabled {
             return;
@@ -121,8 +122,6 @@ impl App {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "JavaScript code expansion matched"
                 );
-
-                return;
             }
             Ok(None) => {}
             Err(error) => {
@@ -144,8 +143,10 @@ impl App {
             candidate_count = self
                 .query
                 .as_ref()
-                .map_or(0, |query| query.candidates().len()),
-            total_candidate_count = self.query.as_ref().map_or(0, Query::total_count),
+                .map_or(0, |query| query.candidates().len())
+                + usize::from(self.expanded_candidate.is_some()),
+            total_candidate_count = self.query.as_ref().map_or(0, Query::total_count)
+                + usize::from(self.expanded_candidate.is_some()),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "dictionary query completed"
         );
@@ -167,23 +168,26 @@ impl App {
             return String::new();
         }
 
-        // Render the actual input code first, then the current query page, then
-        // arrows derived from the known exact-code count.
+        // Render the expansion result first on the first page, followed by the
+        // dictionary candidates. Later pages contain dictionary candidates only.
         let query = self.query.as_ref();
+        let page_index = query.map_or(0, Query::page_index);
+        let expanded_visible = self.expanded_candidate_is_visible();
 
-        let (candidates, page_index, total_count, has_next_page) =
-            if let Some(candidate) = self.expanded_candidate.as_ref() {
-                (std::slice::from_ref(candidate), 0, 1, false)
-            } else if let Some(query) = query {
-                (
-                    query.candidates(),
-                    query.page_index(),
-                    query.total_count(),
-                    query.has_next_page(),
-                )
-            } else {
-                (&[][..], 0, 0, false)
-            };
+        // Chain borrowed iterators instead of allocating a temporary candidate Vec
+        // on every preedit update.
+        let expanded_candidate = if expanded_visible {
+            self.expanded_candidate.as_deref()
+        } else {
+            None
+        };
+        let candidates = expanded_candidate.into_iter().chain(query.into_iter().flat_map(
+            |query| query.candidates().iter().map(String::as_str),
+        ));
+
+        let total_count = query.map_or(0, Query::total_count)
+            + usize::from(self.expanded_candidate.is_some());
+        let has_next_page = query.is_some_and(Query::has_next_page);
 
         let indicator = page_indicator(page_index, total_count, has_next_page);
         let indicator_reserve = if indicator.is_empty() {
@@ -192,7 +196,7 @@ impl App {
             1 + indicator.len() // separating space plus the UTF-8 indicator bytes
         };
         let mut candidates_text = String::new();
-        for (index, candidate) in candidates.iter().enumerate() {
+        for (index, candidate) in candidates.enumerate() {
             let item = format!(
                 "{}{}{}",
                 if candidates_text.is_empty() { "" } else { " " },
@@ -218,6 +222,28 @@ impl App {
             format!("{} {}", self.composing, candidates_text)
         } else {
             format!("{} {} {}", self.composing, candidates_text, indicator)
+        }
+    }
+
+    /// The expansion result is prepended only to the first dictionary page.
+    fn expanded_candidate_is_visible(&self) -> bool {
+        self.expanded_candidate.is_some()
+            && self
+                .query
+                .as_ref()
+                .map_or(true, |query| query.page_index() == 0)
+    }
+
+    /// Return the first candidate on the current page, including an expansion
+    /// result when it is visible on the first page.
+    fn first_candidate(&self) -> Option<&str> {
+        if self.expanded_candidate_is_visible() {
+            self.expanded_candidate.as_deref()
+        } else {
+            self.query
+                .as_ref()
+                .and_then(|query| query.candidates().first())
+                .map(String::as_str)
         }
     }
 
@@ -325,23 +351,19 @@ impl App {
     }
 
     fn select_candidate(&mut self, index: usize) -> bool {
-        let candidate = if let Some(candidate) = self.expanded_candidate.as_ref() {
-            if index != 0 {
-                return false;
-            }
-
-            candidate.clone()
+        let expanded_visible = self.expanded_candidate_is_visible();
+        let candidate = if expanded_visible && index == 0 {
+            self.expanded_candidate.clone()
         } else {
-            let Some(candidate) = self
-                .query
+            let query_index = index.saturating_sub(usize::from(expanded_visible));
+            self.query
                 .as_ref()
-                .and_then(|query| query.candidates().get(index))
+                .and_then(|query| query.candidates().get(query_index))
                 .cloned()
-            else {
-                return false;
-            };
+        };
 
-            candidate
+        let Some(candidate) = candidate else {
+            return false;
         };
 
         self.commit_text(candidate);
@@ -768,7 +790,12 @@ impl App {
             } else {
                 (key - KEY_1) as usize
             };
-            if local_index < self.page_size.get() {
+            let candidate_count = self
+                .query
+                .as_ref()
+                .map_or(0, |query| query.candidates().len())
+                + usize::from(self.expanded_candidate_is_visible());
+            if local_index < candidate_count {
                 self.select_candidate(local_index);
             }
             return true;
@@ -779,14 +806,8 @@ impl App {
                 // Space commits the first candidate on the current page (or the
                 // raw code if there are no candidates), without trailing space.
                 let text = self
-                    .expanded_candidate
-                    .clone()
-                    .or_else(|| {
-                        self.query
-                            .as_ref()
-                            .and_then(|query| query.candidates().first())
-                            .cloned()
-                    })
+                    .first_candidate()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| self.composing.clone());
                 self.commit_text(text);
                 return true;
@@ -818,17 +839,7 @@ impl App {
         if let Some(punctuation) = evdev_chinese_punctuation(key, shift_pressed) {
             let mut text = String::new();
             if !self.composing.is_empty() {
-                text.push_str(
-                    self.expanded_candidate
-                        .as_deref()
-                        .or_else(|| {
-                            self.query
-                                .as_ref()
-                                .and_then(|query| query.candidates().first())
-                                .map(String::as_str)
-                        })
-                        .unwrap_or(self.composing.as_str()),
-                );
+                text.push_str(self.first_candidate().unwrap_or(self.composing.as_str()));
             }
             text.push_str(punctuation);
             self.commit_text(text);
@@ -1312,3 +1323,4 @@ impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
         }
     }
 }
+
