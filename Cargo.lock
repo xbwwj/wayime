@@ -3719,6 +3719,7 @@ dependencies = [
  "libc",
  "quickjs-jit",
  "quickjs-jit-runtime",
+ "regex",
  "rusqlite",
  "serde",
  "tempfile",

@@ -31,3 +31,4 @@ wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 
 cpal = "0.18"
 ferrous-opencc = "0.4.0"
+regex = "1"

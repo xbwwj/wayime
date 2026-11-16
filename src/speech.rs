@@ -3,7 +3,10 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +17,7 @@ use cpal::{
     FromSample, SampleFormat, SizedSample, I24, U24,
 };
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
+use regex::Regex;
 use tracing::{debug, warn};
 
 const RECORD_SECONDS: u64 = 10;
@@ -307,6 +311,36 @@ fn join_transcript_segments(output: &str) -> String {
     joined
 }
 
+/// 规范化语音识别文本中的中英文混排格式。
+///
+/// 规则：
+/// 1. 两个汉字之间的英文逗号替换为中文逗号。
+/// 2. 汉字和 ASCII 英文字母相邻时插入一个空格。
+///
+/// 已经存在空格的地方不会重复插入。
+fn normalize_transcript(text: &str) -> String {
+    static CHINESE_COMMA: OnceLock<Regex> = OnceLock::new();
+    static HAN_LATIN: OnceLock<Regex> = OnceLock::new();
+    static LATIN_HAN: OnceLock<Regex> = OnceLock::new();
+
+    let chinese_comma = CHINESE_COMMA
+        .get_or_init(|| Regex::new(r"(\p{Han}),(\p{Han})").expect("valid Chinese comma regex"));
+
+    let han_latin = HAN_LATIN.get_or_init(|| {
+        Regex::new(r"(\p{Han})([A-Za-z])").expect("valid Han-to-Latin spacing regex")
+    });
+
+    let latin_han = LATIN_HAN.get_or_init(|| {
+        Regex::new(r"([A-Za-z])(\p{Han})").expect("valid Latin-to-Han spacing regex")
+    });
+
+    // 先处理中文逗号，再处理汉字与英文字母之间的空格。
+    let text = chinese_comma.replace_all(text, "$1，$2");
+    let text = han_latin.replace_all(&text, "$1 $2");
+
+    latin_han.replace_all(&text, "$1 $2").into_owned()
+}
+
 /// Write audio to a temporary WAV file and invoke whisper.cpp CLI.
 ///
 /// The optional command receiver allows the worker to terminate the child
@@ -426,7 +460,10 @@ fn transcribe_with_cli(
     let opencc = OpenCC::from_config(BuiltinConfig::T2s)
         .context("failed to initialize OpenCC T2s converter")?;
 
-    Ok(Some(opencc.convert(&transcript)))
+    let simplified = opencc.convert(&transcript);
+
+    // Apply punctuation and Chinese-English spacing normalization after OpenCC.
+    Ok(Some(normalize_transcript(&simplified)))
 }
 
 /// 一个由后台线程独占的、可被键盘命令随时停止的录音。
@@ -766,4 +803,42 @@ pub fn run(model_path: &Path, language: &str) -> Result<()> {
     println!("{transcript}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_transcript;
+
+    #[test]
+    fn replaces_english_comma_between_chinese_characters() {
+        assert_eq!(normalize_transcript("你好,世界"), "你好，世界");
+        assert_eq!(normalize_transcript("我,爱Rust"), "我，爱 Rust");
+    }
+
+    #[test]
+    fn inserts_spaces_between_chinese_and_english() {
+        assert_eq!(normalize_transcript("学习Rust语言"), "学习 Rust 语言");
+        assert_eq!(
+            normalize_transcript("使用Wayland开发输入法"),
+            "使用 Wayland 开发输入法"
+        );
+        assert_eq!(normalize_transcript("Rust语言"), "Rust 语言");
+        assert_eq!(normalize_transcript("中文English"), "中文 English");
+    }
+
+    #[test]
+    fn preserves_english_commas_and_existing_spaces() {
+        assert_eq!(
+            normalize_transcript("Hello, world"),
+            "Hello, world"
+        );
+        assert_eq!(
+            normalize_transcript("中文, English"),
+            "中文, English"
+        );
+        assert_eq!(
+            normalize_transcript("中文 English"),
+            "中文 English"
+        );
+    }
 }
