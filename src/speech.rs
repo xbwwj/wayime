@@ -327,11 +327,13 @@ fn normalize_transcript(text: &str) -> String {
         .get_or_init(|| Regex::new(r"(\p{Han}),(\p{Han})").expect("valid Chinese comma regex"));
 
     let han_latin = HAN_LATIN.get_or_init(|| {
-        Regex::new(r"(\p{Han})([A-Za-z])").expect("valid Han-to-Latin spacing regex")
+        Regex::new(r"(\p{Han})([A-Za-z0-9])")
+            .expect("valid Han-to-ASCII-alphanumeric spacing regex")
     });
 
     let latin_han = LATIN_HAN.get_or_init(|| {
-        Regex::new(r"([A-Za-z])(\p{Han})").expect("valid Latin-to-Han spacing regex")
+        Regex::new(r"([A-Za-z0-9])(\p{Han})")
+            .expect("valid ASCII-alphanumeric-to-Han spacing regex")
     });
 
     // 先处理中文逗号，再处理汉字与英文字母之间的空格。
@@ -828,17 +830,18 @@ mod tests {
 
     #[test]
     fn preserves_english_commas_and_existing_spaces() {
-        assert_eq!(
-            normalize_transcript("Hello, world"),
-            "Hello, world"
-        );
-        assert_eq!(
-            normalize_transcript("中文, English"),
-            "中文, English"
-        );
-        assert_eq!(
-            normalize_transcript("中文 English"),
-            "中文 English"
-        );
+        assert_eq!(normalize_transcript("Hello, world"), "Hello, world");
+        assert_eq!(normalize_transcript("中文, English"), "中文, English");
+        assert_eq!(normalize_transcript("中文 English"), "中文 English");
+    }
+
+    #[test]
+    fn inserts_spaces_between_chinese_and_ascii_digits() {
+        assert_eq!(normalize_transcript("2026年"), "2026 年");
+        assert_eq!(normalize_transcript("第3章"), "第 3 章");
+        assert_eq!(normalize_transcript("中文123"), "中文 123");
+        assert_eq!(normalize_transcript("123中文"), "123 中文");
+        assert_eq!(normalize_transcript("版本2Release"), "版本 2Release");
+        assert_eq!(normalize_transcript("Rust2026年"), "Rust2026 年");
     }
 }
